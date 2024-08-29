@@ -6,6 +6,7 @@ applications
 import json
 import os
 from base64 import urlsafe_b64encode
+from enum import Enum
 from struct import pack
 
 from cryptography.hazmat.backends import default_backend
@@ -15,6 +16,22 @@ from fido2 import cbor
 from fido2.cose import ES256
 from fido2.webauthn import AttestedCredentialData
 from fido2.utils import sha256
+
+
+# https://www.w3.org/TR/webauthn-3/#sctn-authenticator-data
+class AuthenticatorDataFlags(Enum):
+    """
+    Values for authenticator data flags
+    """
+
+    USER_PRESENT = (1 << 0)
+    RESERVED1 = (1 << 1)
+    USER_VERIFIED = (1 << 2)
+    BACKUP_ELIGIBLE = (1 << 3)
+    BACKED_UP = (1 << 4)
+    RESERVED2 = (1 << 5)
+    ATTESTED_CREDENTIAL_DATA_INCLUDED = (1 << 6)
+    EXTENSION_DATA_INCLUDED = (1 << 7)
 
 
 class SoftWebauthnDevice():
@@ -27,10 +44,32 @@ class SoftWebauthnDevice():
     def __init__(self):
         self.credential_id = None
         self.private_key = None
-        self.aaguid = b'\x00'*16
+        self.aaguid = b'\x00' * 16
         self.rp_id = None
         self.user_handle = None
         self.sign_count = 0
+
+    @staticmethod
+    def convert_flags(flags):
+        """Converts flag-like values into final binary representation"""
+
+        result = 0
+        for flag in flags:
+            if isinstance(flag, AuthenticatorDataFlags):
+                value = flag.value
+            elif isinstance(flag, int):
+                if flag > (1 << 7):
+                    raise ValueError(f"Invalid flag value {flag}")
+                value = flag
+            else:
+                raise ValueError(
+                    f"Flag can either be an integer or an instance of AuthenticatorDataFlags. "
+                    f"{flag} was provided, which is {type(flag)}"
+                )
+
+            result |= value
+
+        return result.to_bytes(1, "little")
 
     def cred_init(self, rp_id, user_handle):
         """initialize credential for rp_id under user_handle"""
@@ -48,8 +87,13 @@ class SoftWebauthnDevice():
             self.credential_id,
             ES256.from_cryptography_key(self.private_key.public_key()))
 
-    def create(self, options, origin):
+    def create(self, options, origin, flags=None):
         """create credential and return PublicKeyCredential object aka attestation"""
+
+        if flags is None:
+            flags = [AuthenticatorDataFlags.ATTESTED_CREDENTIAL_DATA_INCLUDED, AuthenticatorDataFlags.USER_PRESENT]
+
+        flags = self.convert_flags(flags)
 
         if {'alg': -7, 'type': 'public-key'} not in options['publicKey']['pubKeyCredParams']:
             raise ValueError('Requested pubKeyCredParams does not contain supported type')
@@ -68,7 +112,6 @@ class SoftWebauthnDevice():
         }
 
         rp_id_hash = sha256(self.rp_id.encode('ascii'))
-        flags = b'\x41'  # attested_data + user_present
         sign_count = pack('>I', self.sign_count)
         credential_id_length = pack('>H', len(self.credential_id))
         cose_key = cbor.encode(ES256.from_cryptography_key(self.private_key.public_key()))
@@ -90,8 +133,13 @@ class SoftWebauthnDevice():
             'type': 'public-key'
         }
 
-    def get(self, options, origin):
+    def get(self, options, origin, flags=None):
         """get authentication credential aka assertion"""
+
+        if flags is None:
+            flags = [AuthenticatorDataFlags.USER_PRESENT]
+
+        flags = self.convert_flags(flags)
 
         if self.rp_id != options['publicKey']['rpId']:
             raise ValueError('Requested rpID does not match current credential')
@@ -107,7 +155,6 @@ class SoftWebauthnDevice():
         client_data_hash = sha256(client_data)
 
         rp_id_hash = sha256(self.rp_id.encode('ascii'))
-        flags = b'\x01'
         sign_count = pack('>I', self.sign_count)
         authenticator_data = rp_id_hash + flags + sign_count
 
